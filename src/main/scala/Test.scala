@@ -18,34 +18,35 @@ trait MongoImplicits {
     private def dropLastSymbol(s: String) = s.substring(0, s.length - 1)
     def oid = ("(.*?)oid(.*?):(.*?)\"".r ~> "(.*?)\"".r) ^^ dropLastSymbol
   }
-  implicit def jsToMongoObject(js: JsValue): MongoDBObject = {
-    def jsToValue(js: JsValue): Any = js match {
-      case JsObject(_)        => jsToMongoObject(js)
-      case JsString(string)   => string
-      case JsNumber(num)      => num.toDouble
-      case JsBoolean(boolean) => boolean.toString
-      case JsArray(arr)       => arr.map{jsToValue(_)}.toList
-      case JsNull             => None
-      case JsUndefined(u)     => u
+  implicit def entityToMongoObject[T](entity: T)(implicit writes: Writes[T]): MongoDBObject = {
+    def jsToMongoObject(js: JsValue): MongoDBObject = {
+      def jsToValue(js: JsValue): Any = js match {
+        case JsObject(_)        => jsToMongoObject(js)
+        case JsString(string)   => string
+        case JsNumber(num)      => num.toDouble
+        case JsBoolean(boolean) => boolean.toString
+        case JsArray(arr)       => arr.map{jsToValue(_)}.toList
+        case JsNull             => None
+        case JsUndefined(u)     => u
+      }
+      js match {
+        case JsObject(fields) => MongoDBObject(fields.map{f => (f._1, jsToValue(f._2))}.toList)
+        case jsValue          => MongoDBObject("value" -> jsToValue(jsValue))
+      }
     }
-    js match {
-      case JsObject(fields) => MongoDBObject(fields.map{f => (f._1, jsToValue(f._2))}.toList)
-      case jsValue          => MongoDBObject("value" -> jsToValue(jsValue))
-    }
-  }
-  implicit def entityToMongoObject[T](entity: T)(implicit writes: Writes[T]): MongoDBObject =
     jsToMongoObject(writes.writes(entity))
-  implicit def mongoObjectToJsValue(mongoObject: DBObject): JsValue = {
-    println(mongoObject.toString)
-    val preprocessed = mongoObject.toString.replaceAll("\"true\"", "true").replaceAll("\"false\"", "false")
-    val replacement = IdParser.parse(IdParser.oid, preprocessed).getOrElse("")
-    val replaced = preprocessed.replaceAll("\"_id\"(.*?):(.*?)\"(.*?)\"(.*?):(.*?)\"}", "\"id\" : \"" + replacement + "\"")
-    Json.parse(replaced)
   }
-  implicit def mongoObjectToEntity[T](mongoObject: DBObject)(implicit reads: Reads[T]): Option[T] = {
-    reads.reads(mongoObjectToJsValue(mongoObject)).asEither match {
+  implicit def mongoObjectToEntity[T <% Identifiable[T]](mongoObject: DBObject)(reads: Reads[T]): Option[T] = {
+    def mongoObjectToJsValue(mongoObject: DBObject): (Option[String], JsValue) = {
+      println(mongoObject.toString)
+      val preprocessed = mongoObject.toString.replaceAll("\"true\"", "true").replaceAll("\"false\"", "false")
+      val id = IdParser.parse(IdParser.oid, preprocessed).getOrElse("")
+      (if (id.isEmpty) None else Some(id), Json.parse(preprocessed))
+    }
+    val pair = mongoObjectToJsValue(mongoObject)
+    reads.reads(pair._2).asEither match {
       case Left(error) => println(error); None
-      case Right(entity) => Some(entity)
+      case Right(entity) => Some(entity.withOptId(pair._1))
     }
   }
 }
@@ -61,14 +62,14 @@ abstract class MongoStorage[T <% Identifiable[T]](val db: MongoDB) extends Mongo
     dbObject.getAs[ObjectId]("_id").map{_.toString}.map{entity.withId(_)}
   }
   def read(id: String): Option[T] = {
-    this.storage.findOneByID(new ObjectId(id)).map{mongoObjectToEntity(_)}.flatten
+    this.storage.findOneByID(new ObjectId(id)).map{mongoObjectToEntity(_)(reads)}.flatten
   }
   def update(entity: T): Option[T] = {
     this.storage.update(MongoDBObject("_id" -> entity.id.map{new ObjectId(_)}), entityToMongoObject(entity.withoutId()))
     entity.id.flatMap{read(_)}
   }
   def remove(id: String) = this.storage.remove(MongoDBObject("_id" -> new ObjectId(id)))
-  def find: List[T] = this.storage.find.toList.map{mongoObjectToEntity(_)}.flatten[T].toList
+  def find: List[T] = this.storage.find.toList.map{mongoObjectToEntity(_)(reads)}.flatten[T].toList
   def drop = this.storage.drop
 }
 trait Identifiable[T] {
@@ -78,15 +79,16 @@ trait Identifiable[T] {
   def withId(id: String): T = withOptId(Option(id))
   def withoutId(): T = withOptId(None)
 
-  protected def withOptId(id: Option[String]): T
+  def withOptId(id: Option[String]): T
 }
 case class Meta(text: String, q: Int, b: Boolean)
 object Meta {
   implicit val metaReads = Json.reads[Meta]
   implicit val metaWrites = Json.writes[Meta]
 }
-case class User(id: Option[String], login: String, password: String, meta: Meta) extends Identifiable[User] {
-  protected def withOptId(id: Option[String]): User = copy(id = id)
+case class User(userId: Option[String], login: String, password: String, meta: Meta) extends Identifiable[User] {
+  def id = userId
+  def withOptId(id: Option[String]): User = copy(userId = id)
 }
 object User {
   import Meta.metaReads
